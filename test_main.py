@@ -1,6 +1,8 @@
 import asyncio
+import io
 import os
 import unittest
+import wave
 from unittest.mock import patch
 
 from fastapi import HTTPException
@@ -24,13 +26,27 @@ class FakeModels:
 
 class FakeClient:
     latest = None
+    instances = 0
 
     def __init__(self, **kwargs):
         self.models = FakeModels()
+        self.closed = False
+        FakeClient.instances += 1
         FakeClient.latest = self
+
+    def close(self):
+        self.closed = True
 
 
 class AssistantTests(unittest.TestCase):
+    def setUp(self):
+        main._close_gemini_client()
+        FakeClient.latest = None
+        FakeClient.instances = 0
+
+    def tearDown(self):
+        main._close_gemini_client()
+
     def request(self):
         return main.AnswerRequest(
             language="sw",
@@ -39,22 +55,39 @@ class AssistantTests(unittest.TestCase):
         )
 
     def test_health_is_available_and_python_service_has_no_database_client(self):
-        self.assertEqual(asyncio.run(main.health()), {"status": "ok", "service": "kidguard-ai-assistant"})
+        with patch.dict(os.environ, {"AI_ASSISTANT_SHARED_SECRET": "s" * 40, "GEMINI_API_KEY": "test-key"}):
+            self.assertEqual(asyncio.run(main.health()), {"status": "ok", "service": "kidguard-ai-assistant"})
         self.assertFalse(hasattr(main, "PrismaClient"))
         self.assertFalse(hasattr(main, "psycopg"))
 
+    def test_health_reports_missing_provider_or_service_secret(self):
+        with patch.dict(os.environ, {}, clear=True):
+            with self.assertRaises(HTTPException) as caught:
+                asyncio.run(main.health())
+        self.assertEqual(caught.exception.status_code, 503)
+
     def test_http_health_and_v1_answer_routes(self):
-        client = TestClient(main.app)
-        health = client.get("/health")
-        self.assertEqual(health.status_code, 200)
-        self.assertEqual(health.json()["status"], "ok")
         payload = {"language": "en", "messages": [{"role": "user", "content": "Hello"}], "context": {"identity": {"role": "parent"}}}
         with patch.dict(os.environ, {"AI_ASSISTANT_SHARED_SECRET": "s" * 40, "GEMINI_API_KEY": "test-key"}), patch.object(main.genai, "Client", FakeClient):
-            answer = client.post("/v1/answer", headers={"X-KidGuard-AI-Secret": "s" * 40}, json=payload)
-            unauthorized = client.post("/v1/answer", json=payload)
+            with TestClient(main.app) as client:
+                health = client.get("/health")
+                answer = client.post("/v1/answer", headers={"X-KidGuard-AI-Secret": "s" * 40}, json=payload)
+                unauthorized = client.post("/v1/answer", json=payload)
         self.assertEqual(answer.status_code, 200)
+        self.assertEqual(health.status_code, 200)
         self.assertEqual(answer.json()["answer"], FakeResponse.text)
         self.assertEqual(unauthorized.status_code, 401)
+        self.assertTrue(FakeClient.latest.closed)
+
+    def test_reuses_one_client_across_requests_and_closes_it_on_shutdown(self):
+        with patch.dict(os.environ, {"AI_ASSISTANT_SHARED_SECRET": "s" * 40, "GEMINI_API_KEY": "test-key"}), patch.object(main.genai, "Client", FakeClient):
+            asyncio.run(main.answer(self.request(), "s" * 40))
+            first_client = FakeClient.latest
+            asyncio.run(main.answer(self.request(), "s" * 40))
+            self.assertIs(FakeClient.latest, first_client)
+            self.assertEqual(FakeClient.instances, 1)
+            main._close_gemini_client()
+            self.assertTrue(first_client.closed)
 
     def test_requires_authenticated_node_service_secret(self):
         with patch.dict(os.environ, {"AI_ASSISTANT_SHARED_SECRET": "x" * 32, "GEMINI_API_KEY": "test"}):
@@ -153,12 +186,79 @@ class AssistantTests(unittest.TestCase):
                 self.models = FailingModels(self.status)
 
         for status, expected in [(429, 429), (503, 502)]:
+            main._close_gemini_client()
             FailingClient.status = status
             with patch.dict(os.environ, {"AI_ASSISTANT_SHARED_SECRET": "s" * 40, "GEMINI_API_KEY": "test-key"}), patch.object(main.genai, "Client", FailingClient):
                 with self.assertRaises(HTTPException) as caught:
                     asyncio.run(main.answer(self.request(), "s" * 40))
             self.assertEqual(caught.exception.status_code, expected)
             self.assertNotIn("private prompt", str(caught.exception.detail))
+
+    def _wav_bytes(self, seconds=1):
+        stream = io.BytesIO()
+        with wave.open(stream, "wb") as audio:
+            audio.setnchannels(1)
+            audio.setsampwidth(2)
+            audio.setframerate(16000)
+            audio.writeframes(b"\0\0" * 16000 * seconds)
+        return stream.getvalue()
+
+    def test_voice_routes_require_node_shared_secret_before_processing_audio(self):
+        with patch.dict(os.environ, {"AI_ASSISTANT_SHARED_SECRET": "s" * 40}):
+            with TestClient(main.app) as client:
+                transcription = client.post("/v1/transcribe", files={"audio": ("voice.wav", self._wav_bytes(), "audio/wav")})
+                synthesis = client.post("/v1/synthesize", data={"text": "Habari", "language": "sw"})
+        self.assertEqual(transcription.status_code, 401)
+        self.assertEqual(synthesis.status_code, 401)
+
+    def test_transcription_accepts_authenticated_sw_and_en_audio_and_returns_text_only(self):
+        wav = self._wav_bytes()
+        with patch.dict(os.environ, {"AI_ASSISTANT_SHARED_SECRET": "s" * 40}), patch.object(main, "_validate_audio"), patch.object(main, "_transcribe_audio", return_value=("Mtoto ametumia kifaa", "sw")) as model:
+            with TestClient(main.app) as client:
+                response = client.post("/v1/transcribe", headers={"X-KidGuard-AI-Secret": "s" * 40}, files={"audio": ("voice.wav", wav, "audio/wav")}, data={"language": "sw"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"transcript": "Mtoto ametumia kifaa", "language": "sw"})
+        model.assert_called_once_with(wav, "sw")
+
+    def test_audio_validation_rejects_oversized_or_unsupported_audio(self):
+        with self.assertRaises(HTTPException) as oversized:
+            main._validate_audio(b"x" * (main._MAX_AUDIO_BYTES + 1))
+        self.assertEqual(oversized.exception.status_code, 413)
+        with patch.dict(os.environ, {"AI_ASSISTANT_SHARED_SECRET": "s" * 40}):
+            with TestClient(main.app) as client:
+                response = client.post("/v1/transcribe", headers={"X-KidGuard-AI-Secret": "s" * 40}, files={"audio": ("bad.wav", b"not audio", "audio/wav")})
+        self.assertEqual(response.status_code, 400)
+
+    def test_transcription_model_failures_are_safe_and_timeout_is_bounded(self):
+        wav = self._wav_bytes()
+        headers = {"X-KidGuard-AI-Secret": "s" * 40}
+        with patch.dict(os.environ, {"AI_ASSISTANT_SHARED_SECRET": "s" * 40}), patch.object(main, "_validate_audio"), patch.object(main, "_transcribe_audio", side_effect=RuntimeError("private audio details")):
+            with TestClient(main.app) as client:
+                failed = client.post("/v1/transcribe", headers=headers, files={"audio": ("voice.wav", wav, "audio/wav")})
+        self.assertEqual(failed.status_code, 502)
+        self.assertNotIn("private audio", failed.text)
+        with patch.dict(os.environ, {"AI_ASSISTANT_SHARED_SECRET": "s" * 40}), patch.object(main, "_validate_audio"), patch.object(main, "_transcribe_audio", side_effect=lambda *_: __import__("time").sleep(0.1)), patch.object(main, "_STT_TIMEOUT_SECONDS", 0.001):
+            with TestClient(main.app) as client:
+                timed_out = client.post("/v1/transcribe", headers=headers, files={"audio": ("voice.wav", wav, "audio/wav")})
+        self.assertEqual(timed_out.status_code, 504)
+
+    def test_synthesis_returns_wav_and_synthesis_failure_is_safe(self):
+        def fake_synthesis(text, language, gender, rate):
+            self.assertEqual((text, language, gender, rate), ("Habari", "sw", "male", 1.0))
+            return b"RIFF\x00\x00\x00\x00WAVE"
+
+        headers = {"X-KidGuard-AI-Secret": "s" * 40}
+        with patch.dict(os.environ, {"AI_ASSISTANT_SHARED_SECRET": "s" * 40}), patch.object(main, "_synthesize_audio", side_effect=fake_synthesis):
+            with TestClient(main.app) as client:
+                response = client.post("/v1/synthesize", headers=headers, data={"text": "Habari", "language": "sw", "gender": "male", "rate": "1"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["content-type"], "audio/wav")
+        self.assertTrue(response.content.startswith(b"RIFF"))
+        with patch.dict(os.environ, {"AI_ASSISTANT_SHARED_SECRET": "s" * 40}), patch.object(main, "_synthesize_audio", side_effect=RuntimeError("private text")):
+            with TestClient(main.app) as client:
+                failed = client.post("/v1/synthesize", headers=headers, data={"text": "hello", "language": "en"})
+        self.assertEqual(failed.status_code, 502)
+        self.assertNotIn("private text", failed.text)
 
 
 if __name__ == "__main__":
